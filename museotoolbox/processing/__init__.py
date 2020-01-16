@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+ #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # =============================================================================
 # ___  ___                       _____           _______
@@ -23,10 +23,11 @@ import tempfile
 # spatial libraries
 from osgeo import __version__ as osgeo_version
 from osgeo import gdal, ogr
-
+from joblib import Parallel, delayed, cpu_count
 
 from ..internal_tools import ProgressBar, push_feedback
-
+from time import time, sleep
+import multiprocessing as mp 
 
 def image_mask_from_vector(
         in_vector, in_image, out_image, invert=False, gdt=gdal.GDT_Byte):
@@ -761,7 +762,6 @@ class RasterMath:
             self._init_raster_parameters(compress=compress)
         else:
             params = self.get_raster_parameters()
-            params = self.get_raster_parameters()
             arg_pos = next(
                 (x for x in params if x.startswith('compress')), None)
             if arg_pos:
@@ -1040,6 +1040,55 @@ class RasterMath:
                 tmp = self._manage_2d_mask(tmp)
                 tmp = np.ma.copy(tmp)
             return tmp
+    
+    
+    
+    def get_coord_block(self, block_number=0):
+        """
+        Get position of a block :
+
+            order as [x,y,width,height]
+
+        Parameters
+        -----------
+        block_number, int, optional (default=0).
+            Position of the desired block.
+
+        Returns
+        --------
+        List of positions of the block [x,y,width,height]
+
+        """
+        if block_number > self.n_blocks:
+            raise ValueError(
+                'There are only {} blocks in your image.'.format(
+                    self.n_blocks))
+        else:
+            row = [l for l in range(0, self.n_lines, self.y_block_size)]
+            col = [c for c in range(0, self.n_columns, self.x_block_size)]
+            
+            row_number = int(block_number / self.n_x_blocks)
+            col_number = int(block_number % self.n_x_blocks)
+            
+            width = min(self.n_columns - col[col_number], self.x_block_size)
+            height = min(self.n_lines - row[row_number], self.y_block_size)
+                        
+            tmp = self._generate_block_array(
+                col[col_number], row[row_number], width, height, self.mask)
+            
+            if self.return_3d is False:
+                tmp = self._manage_2d_mask(tmp)
+                tmp = np.ma.copy(tmp)
+            
+            return [col[col_number], row[row_number], width, height]
+    
+    
+    
+    
+    
+    
+    
+    
 
     def get_random_block(self, random_state=None):
         """
@@ -1210,7 +1259,7 @@ class RasterMath:
                 get_block=True):
 
             if isinstance(X, list):
-                X_ = [np.ma.copy(arr) for arr in X]
+                X_ = [np.ma.copy(arr) for arr in X] #de type numpy mask
                 X = X_[0]  # X_[0] is used to get mask
             else:
                 X_ = np.ma.copy(X)
@@ -1218,13 +1267,13 @@ class RasterMath:
             if self.verbose:
                 self.pb.add_position(self._position)
 
-            for idx, fun in enumerate(self.functions):
+            for idx, fun in enumerate(self.functions):# idx : index et fun les fonctions
                 maxBands = self.outputs[idx].RasterCount
 
                 if not np.all(X.mask == 1):
                     # if all the block is not masked
                     if not self.return_3d:
-                        if isinstance(X_, list):
+                        if isinstance(X_, list): #selon le nombre de bandes demandées 
                             X__ = [arr[~X.mask[:, 0], ...].data for arr in X_]
                         else:
                             X__ = X[~X.mask[:, 0], ...].data
@@ -1312,7 +1361,141 @@ class RasterMath:
                             fun.__name__)))
             self.outputs[idx] = None
 
+    def run_Parallel (self, n_jobs = 1, verbose_Parallel = 0):
+        """
+        Process writing with outside function with parallel mode using joblib.
+        
+        
+        Parameters
+        ----------
+        n_jobs : int, optional
+            Numbers of workers or process that will work in parallel.
+        verbose_Parallel : int, optional 
+            The verbosity level: if non zero, progress messages are printed.
+            Above 50, the output is sent to stdout. The frequency of the messages 
+            increases with the verbosity level. If it more than 10, all iterations are reported.
 
+        Returns
+        -------
+        None
+        """
+   
+        if n_jobs < 0 :
+            n_jobs = cpu_count()
+        elif n_jobs == 0 :
+            raise ValueError(' {} is not a valid value.'.format(n_jobs))
+            
+
+        self.pb = ProgressBar(self.n_blocks, message=self.message)
+        
+        for i in range(0,self.n_blocks,n_jobs):
+            self.pb.add_position(self._position)
+           
+            if i+n_jobs <=self.n_blocks-n_jobs :
+                idx_blocks=[i for i in range(i,i+n_jobs)]
+            else :
+                idx_blocks = [i for i in range(i,self.n_blocks)]
+
+            for idx,fun in enumerate(self.functions):
+
+                if self.functionsKwargs[idx] is not False:
+                    res=Parallel(n_jobs=len(idx_blocks),max_nbytes ='10G', verbose = verbose_Parallel)(delayed(fun)(self.get_block(i),**self.functionsKwargs[idx])for i in  idx_blocks)
+                else : 
+                    res=Parallel(n_jobs=len(idx_blocks),max_nbytes ='10G',verbose = verbose_Parallel)(delayed(fun)(self.get_block(i))for i in  idx_blocks)
+
+                self._write_few_blocks(idx_blocks , res ,idx)
+
+                
+            self._position += 1
+        self.outputs[idx] = None
+        self.pb.add_position(self.n_blocks)
+        
+    
+    
+    def run_Parallel_short (self, n_jobs = 1, verbose_Parallel = 0):
+        """
+        Function under construction and used for tests 
+        Apply a function of idx [0] to an image with parallel mode using joblib.
+        Warning : this function does not write the results in an output. 
+        
+        Parameters
+        ----------
+        n_jobs : int, optional
+            Numbers of workers or process that will work in parallel.
+        verbose_Parallel : int, optional 
+            The verbosity level: if non zero, progress messages are printed.
+            Above 50, the output is sent to stdout. The frequency of the messages 
+            increases with the verbosity level. If it more than 10, all iterations are reported.
+
+        Returns
+        -------
+        None
+        """
+        #create a list of all the blocks 
+        blocks = [self.get_block(i) for i in range(self.n_blocks)]
+        #fun get the first function of the rastermath object
+        fun = self.functions[0]
+        #Parallel function
+        Parallel(n_jobs, verbose = verbose_Parallel)(delayed(fun)(i) for i in blocks)   
+
+
+    
+    def _write_few_blocks (self, idx_blocks, tab_blocks, idx_func): 
+        """
+        Uses _write_block to write some blocks from a list to a raster
+
+        Parameters
+        ----------
+        idx_blocks : list.
+            List of indexes of all blocks
+        tab_blocks : list.
+            List of values or tab that will be written in the output image
+        idx_func : int
+            function's index 
+
+        Returns
+        -------
+        None.
+
+        """
+
+        for i in range  (len(idx_blocks)):
+                    self._write_block( idx_blocks[i] ,tab_blocks[i] , idx_func)
+                    
+                    
+    def _write_block(self, idx_block, tab_block, idx_func):
+        """
+        Write a block at a position on a output image
+
+        Parameters
+        ----------
+        idx_block : int.
+            List of indexes of all blocks
+        tab_blocks : numpy tab.
+            List of values or tab that will be written in the output image
+        idx_func : int
+            function's index
+        
+        Returns
+        -------
+        None.
+        """
+        maxBands = self.outputs[idx_func].RasterCount 
+        for ind in range(maxBands):
+            # write result band per band
+            indGdal = ind + 1
+            curBand = self.outputs[idx_func].GetRasterBand(indGdal)
+    
+            resToWrite = tab_block[..., ind]
+            if self.return_3d is False:
+                # need to reshape as block
+                coordos = self.get_coord_block(idx_block) 
+                tmparr = resToWrite.reshape(coordos[3], coordos[2])
+                resToWrite = self.reshape_ndim(tmparr)
+    
+            curBand.WriteArray(resToWrite,coordos[0],coordos[1])
+            curBand.FlushCache()
+        
 def sample_extraction(
         in_image,
         in_vector,
